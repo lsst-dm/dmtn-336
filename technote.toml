@@ -1,0 +1,23 @@
+[technote]
+id = "DMTN-336"
+series_id = "DMTN"
+canonical_url = "https://dmtn-336.lsst.io"
+github_url = "https://github.com/lsst-dm/dmtn-336"
+github_default_branch = "main"
+date_created = 2026-03-12T20:53:11Z
+organization.name = "NSF-DOE Vera C. Rubin Observatory"
+organization.ror = "https://ror.org/048g3cy84"
+license.id = "CC-BY-4.0"
+
+[technote.status]
+state = "draft"
+
+[[technote.authors]]
+name.given = "Alexander"
+name.family = "Broughton"
+internal_id = "broughtona"
+orcid = "https://orcid.org/0000-0001-6966-5316"
+[[technote.authors.affiliations]]
+name = "SLAC National Accelerator Laboratory"
+internal_id = "SLAC-Kavli"
+address = "Menlo Park"
