@@ -1,46 +1,60 @@
 # Calibration and Correction of the Brighter-Fatter Effect in CCDs
 
 ```{abstract}
-This document is a reference for the calibration and correction of the Brighter-Fatter effect (BFE) in charge-coupled devices. It summarizes the physical basis, the data requirements, and the algorithmic steps needed to derive BFE calibrations from flat-field statistics and to apply corrections to science images. The presentation is implementation-agnostic so that other projects and telescopes can adopt or adapt the procedure. The approach is grounded in the literature (Astier et al., Broughton et al., Coulton et al.) and reflects the methods used for the LSST Camera; an appendix points to the LSST Science Pipelines implementation for comparison.
+This living technote will be updated with descriptions of all the algorithms for Brighter-Fatter calibration and correction in the LSST DM Science Pipelines. It is intended to serve as a reference document, and it will include detailed descriptions of the algorithms used and deployed for specific data previews and data releases. It will also contain the verification and acceptance criteria used for calibration deployment.
 ```
 
-This note is written for **implementers**: instrument teams or data reduction groups who need to add Brighter-Fatter calibration and correction to their own pipelines. It emphasizes **what to measure**, **what models to fit**, and **how to obtain and apply** the calibration products. LSST-specific code and configuration are confined to the appendix.
-
-**How to use this document.** If you are new to the BFE, start with [What is the Brighter-Fatter effect?](#what-is-the-brighter-fatter-effect). If you already know the physics and want to implement the procedure, go to [Data requirements](#data-requirements) and then [Procedure overview](#procedure-overview). The [Summary table](#summary-and-recommended-choices) at the end gives a compact checklist of choices and recommendations.
-
----
 
 (what-is-the-brighter-fatter-effect)=
 ## What is the Brighter-Fatter effect?
 
-**The physical picture.** In a CCD, charge builds up in each pixel during an exposure. That charge alters the electric field inside the sensor. As a result, later-arriving photoelectrons are deflected slightly and may land in a neighboring pixel instead of the one they would have hit in an empty detector. Brighter pixels therefore collect *more* charge than they would if pixels were independent—they effectively have a larger area—and dimmer pixels collect less. This is the **Brighter-Fatter effect (BFE)**.
+Correlations between neighboring pixels have been shown to arise at high signal levels in charge-coupled devices (CCDs). This is attributed to and has been accurately modeled by considering that captured photocharges in the potential wells distort the boundaries of pixels. of pixels produce significant transverse electric fields on incoming photocharges. During the integration of an exposure, photo-electrons deflect into neighboring pixels in reaction to quasistatic changes in effective pixel area from the accumulated charges in the potential wells of the pixels, causing the measured light profile of a bright source to differ from that source’s intrinsic surface brightness profile. This effect, dubbed the brighter-fatter effect (BFE), broadens intrinsic surface brightness profiles. The magnitude of the BFE depends on the surface brightness profile of the source itself and thus cannot be modeled solely by its location on a sensor. The consequence is that the BFE breaks the critical assumption of experimental imaging analysis that the pixels are independent light collectors that perfectly obey Poisson statistics.
 
-**Consequences.** Flat-field images no longer follow simple Poisson statistics: the variance of a uniform flat does not scale linearly with the mean flux. Instead, the variance **flattens at high flux** (“variance deficit”). At the same time, **nearby pixels become correlated**: their counts covary in a way that grows with flux and falls off with distance. For science that depends on accurate shapes or fluxes (e.g. weak lensing or photometry), the BFE must be calibrated and corrected.
+Flat-field images have been shown to exhibit non-linear behavior at high signal levels due to the dynamic behavior of charges collecting in the potential wells of pixels. The variance of a uniformly illuminated flat does not scale linearly with the mean flux as would be predicted from simple shot-noise statistics. Instead, we observe variance deficit at higher signal levels. This is because the counts in nearby pixels covary in a way that grows with flux and falls off with distance.
 
-**What the literature shows.** **Astier et al. (2019)** [*A&A* **629**, A36; [arXiv:1905.08677](https://arxiv.org/abs/1905.08677)] showed that this variance deficit and the pixel correlations are linked, and they gave an analytical model for both. The observed behavior is consistent with charge being redistributed during drift in the sensor. **Broughton et al. (2023)** [arXiv:2312.03115] demonstrated on LSST Camera data that the effect **depends on flux** (higher-order terms matter), so a single flux-independent correction kernel is an approximation; they recommend building the kernel from the covariance model evaluated at a chosen flux and enforcing **zero-sum** on the kernel for charge conservation.
+The Brighter-Fatter corrections implemented in the LSST Data Management Science Pipelines come in two flavors that can be swapped in/out in instrument signature removal (ISR), but require two separate calibrations.
 
----
+1. Scalar Kernel Correction: based off of Coulton et al. (2019)
+2. Vector Electrostatic Model Correction: based off of Astier et al. (2023)
 
-## What we measure: covariances from flat-field pairs
+Both correction are derived from the same input measurements, but have different assumptions and configuration parameters.
 
-To calibrate the BFE we need the **covariance** between pixel counts as a function of mean signal level. Those covariances are measured from **pairs of flat-field exposures** at the same nominal illumination.
+All calibrations are defined data products that are released with data previews and data releases alongside downstream science data products and are data Butler accessible from all repositories.
 
-**Idea.** Take two flats $F_1$ and $F_2$ at the same flux level. Their difference $F_1 - F_2$ removes the fixed pattern and leaves mainly photon noise and any BFE-induced correlations. The covariance between a central pixel and a neighbor at lag $(i,j)$ is defined (Broughton et al. 2023, Eq. 1) as:
+**Key characteristics of the BFE**
+
+- The strength of the BFE varies non-linearly with signal level due to complicated "feedback" mechanisms between the collected charges (including longitudinal fields that increase the drift time of the electrons); we refer to these effects as "higher-order BF".
+- The BFE may vary per detector and per amplifier, however across the LSSTCam focal plane the same detector species have actually quite similar BF statstics. We currently compute a single BF calibration per-detector, however we are considering in the future implementing a single calibration per physical detector type (ITL-type vs E2V-type).
+- The BFE is chromatic: charges are stored at the bottom of the potential well, which corresponds to a few microns above the bottom of the pixel; most of the deflection of an electron drifting to the bottom of the potential well therefore occurs in the last several microns. Bluer photon convert to electrons closer to the top of the silicon than redder photons (photons in bands u$\rightarrow$r mostly convert near the top and are therefore achromatic and the same calibration can be used for these bands, but photons in bands i$\rightarrow$y vary drastically and each require different calibrations.)
+- The BFE is stronger in one (+y parallel) direction than in the other (+x serial) direction.
+
+**Previous literature on the BFE** 
+
+Key studies establishing the theoretical and observational basis for the Brighter-Fatter Effect include:
+
+- **Downing et al. (2006)** — Identified covariance sum rules and charge conservation in CCDs.
+- **Holland et al. (2014)** — Presented physical models and sensor effects influencing pixel correlations.
+- **Lage et al. (2017)** — Provided detailed modeling of electric fields and boundary shifts relevant to the BFE.
+- **Astier et al. (2019)** [*A&A* **629**, A36; [arXiv:1905.08677](https://arxiv.org/abs/1905.08677)] — Showed that variance deficit and pixel correlations are linked and provided an analytical model for both. The observed behavior is consistent with charge being redistributed during drift in the sensor.
+- **Broughton et al. (2024)** [arXiv:2312.03115] — Demonstrated on LSST Camera data that the effect **depends on flux** (higher-order terms matter), so a single flux-independent correction kernel is an approximation; they recommend building the kernel from the covariance model evaluated at a chosen flux and enforcing **zero-sum** on the kernel for charge conservation.
+
+
+## What do we measure?
+
+To calibrate the BFE we need the covariance between pixel counts as a function of mean signal level. Those covariances are measured from pairs of flat-field exposures at the same nominal illumination.
+
+The photon transfer curve take two flats $F_1$ and $F_2$ at the same flux level. Their difference $F_1 - F_2$ removes the fixed pattern and leaves mainly photon noise and any BFE-induced correlations. The covariance between a central pixel and a neighbor at lag $(i,j)$ is defined (Broughton et al. 2023, Eq. 1) as:
 
 $$
 C_{ij} = \frac{1}{2}\,\mathrm{Cov}\bigl(F_1(\mathbf{x})-F_2(\mathbf{x}),\;
 F_1(\mathbf{x}')-F_2(\mathbf{x}')\bigr), \qquad \mathbf{x}' = (i,j).
 $$
 
-The factor $1/2$ comes from the pair-difference construction. If pixels were independent and Poissonian, the variance $C_{00}$ would be linear in the mean flux $\mu$. The observed flattening of the variance at high flux is the variance deficit. Summing covariances over all lags recovers the lost variance (charge conservation; Downing et al. 2006). In practice, covariances are computed from the difference image using an FFT-based method (Astier et al. 2019, Appendix A).
+The factor 1/2 comes from the pair-difference construction. By repeating this for many flat pairs at different flux levels, we obtain the variance and covariances as a function of mean signal ($\mu$), which the Photon Transfer curve (PTC). The observed flattening of the variance at high flux is the variance deficit (roughly 30\% loss at a signal level of $0.75\times$ saturation level). Summing covariances over all lags recovers the lost variance (charge conservation; Downing et al. 2006). In practice, covariances are computed from the difference image using an FFT-based method (Astier et al. 2019, Appendix A). From this information, we can fit an analytic model to this PTC so we can extract gain, noise, and the BFE-related parameters that are use for calibration. If pixels were independent and Poissonian, the variance $C_{00}$ would be linear in the mean flux $\mu$. 
 
-**Photon transfer curve (PTC).** By repeating this for many flat pairs at different flux levels, we obtain the variance and covariances as a function of mean signal $\mu$. That relationship is the **photon transfer curve (PTC)**. The next step is to fit a model to this PTC so we can extract gain, noise, and the BFE-related “a matrix” used for correction.
+**Quantifying the BFE**
 
----
-
-## The full covariance model and the a matrix
-
-**Model.** Astier et al. (2019) Eq. 20 and Broughton et al. (2023) Eq. 2 parameterize the covariance at mean signal $\mu$ (in ADU) as:
+Astier et al. (2019) Eq. 20 and Broughton et al. (2023) Eq. 2 parameterize the covariance at mean signal $\mu$ (in ADU) as:
 
 $$
 C_{ij}(\mu) = \frac{\mu}{g}\Bigl[\delta_{i0}\delta_{j0}
@@ -49,15 +63,18 @@ C_{ij}(\mu) = \frac{\mu}{g}\Bigl[\delta_{i0}\delta_{j0}
   + \frac{1}{6}[\ldots]_{ij}(\mu g)^3 + \cdots\Bigr] + \frac{n_{ij}}{g^2}.
 $$
 
-**What the symbols mean.**
-
 - $g$ is the gain (electrons per ADU). $n_{ij}$ is the noise covariance matrix (read noise, etc.).
 - $a_{ij}$ (units 1/e⁻) is the **fractional pixel area change** from accumulated charge—the linear part of the BFE. It is often called the **a matrix**.
 - $b_{ij}$ is a higher-order, time-evolving term; in practice it is often fixed to zero to stabilize the fit.
 - $\otimes$ denotes discrete convolution. The terms in $\mu^2$ and $\mu^3$ are **higher-order BFE**; they are not negligible (e.g. ~20% of variance loss in Astier et al.; 15–30% in Broughton et al. at high flux).
 
-**Fitting.** Fitting this model to the measured $C_{ij}(\mu)$ over a chosen flux range yields gain $g$, noise $n_{ij}$, and the **a matrix** (and optionally **b**) per amplifier. When **b** is fixed to zero, the fitted **a** matrix approximately satisfies $\sum a_{ij} \approx 0$ (zero-sum; Broughton et al.). The flux range should be restricted to below “turnoff” (e.g. pCTI turnoff) so that other effects near saturation do not contaminate the BFE estimate.
+Fitting this model to the measured $C_{ij}(\mu)$ over a chosen flux range yields gain $g$, noise $n_{ij}$, and the **a matrix** (and optionally **b**) per amplifier. When **b** is fixed to zero, the fitted **a** matrix approximately satisfies $\sum a_{ij} \approx 0$ (zero-sum; Broughton et al.). The flux range should be restricted to below “turnoff” (e.g. pCTI turnoff) so that other effects near saturation do not contaminate the BFE estimate.
 
+**Note: that this equation is derived from a Taylor expansion of the photon transfer curve, and does not derive from electrostatics.**
+
+**Note: in practice we found that approximately 500 flat pairs (or 1000 exposures) gives us the statistics needed to fit the BFE coefficients out to a lag of 10 pixels.**
+
+**Note: the BFE as measured in flat fields has been shown to be different between flat-field images and the magnitude dependence of size/shape of PSF stars because fundamentally the charge distributions per pixel are vastly different between the two images, and it is believed that the increased charge gradients produce a larger BFE (see Broughton et al. (2024) for more details).**
 ---
 
 ## From covariances to a correction kernel
@@ -83,53 +100,19 @@ $$
   + \frac{1}{2}\nabla\cdot\bigl[F(\mathbf{x})\,\nabla(K\otimes F(\mathbf{x}))\bigr].
 $$
 
-The factor $1/2$ averages the BFE over the exposure. In practice the correction is applied **iteratively**: update $F$ with the right-hand side, then repeat until the change per iteration is below a threshold (e.g. 10 electrons; typically 2–3 iterations).
+The factor $1/2$ averages the BFE over the exposure. In practice the correction is applied **iteratively**: we update $F$ with the right-hand side, then repeat until the total amount of shifted charge across a single detector image in an iteration falls below a threshold (e.g. 10 electrons; typically 2–3 iterations if the calibration is good).
 
-**Choice of flux.** Because the true covariance depends on $\mu$, there is no single “correct” flux at which to evaluate $\widetilde{C}_{ij}$ to build $K$. Broughton et al. recommend **sampling** the full covariance model at a chosen flux (e.g. where correction matters most) so that higher-order terms are included in the kernel.
+**Note: Because the true covariance depends on $\mu$, there is no single “correct” flux at which to evaluate $\widetilde{C}_{ij}$ to build $K$. Broughton et al. recommend **sampling** the full covariance model at a chosen flux (e.g. where correction matters most) so that higher-order terms are included in the kernel, though there is currenly no stable implementated pipeline for this in the software.**
 
----
-
-(data-requirements)=
-## Data requirements
-
-**What to observe.** You need **flat-field pairs**: two exposures at the **same nominal illumination** (e.g. same integration time or flux-matched). Many such pairs are needed across a **range of flux levels**, from well above read noise up to a safe limit below saturation. Optional: bias and dark frames for calibration; an independent flux measurement (e.g. photodiode) for gain or linearity if desired.
-
-**What to compute from each pair.** For each amplifier (or region of interest):
-
-1. **Mean signal** $\mu$ (e.g. average of the two flat means).
-2. **Variance** of the difference image → gives $C_{00}$ at that $\mu$.
-3. **Covariances** $C_{ij}$ at lags $(i,j)$ out to a chosen maximum (e.g. 8–10 pixels), from the same difference image (FFT method in Astier et al. Appendix A).
-
-The result is a set of **PTC data**: $\mu$, variance, and covariance matrices as a function of $\mu$.
-
----
 
 (procedure-overview)=
-## Procedure overview
+## Calibration Generation
 
-The calibration has three main stages.
+All BFE calibration tasks take as input a single PTC data product, produced per-detector in a single filter band.
 
-1. **Measure covariances and fit the PTC.** Pair flats, form difference images, compute $C_{ij}$ at each lag (Eq. 1), then fit the full covariance model (Eq. 2) over the chosen flux range. You obtain gain, noise, and the **a matrix** per amplifier.
-2. **Build a correction kernel (kernel-based correction).** From the PTC data (and optionally the fitted model), form a single “pre-kernel” (correlation matrix) per amplifier, enforce zero-sum, solve $\nabla^2 K = \text{source}$ for $K$, and optionally check the kernel for validity. Apply the correction with Eq. 5 iteratively.
-3. **Or fit an electrostatic model (model-based correction).** Alternatively, fit a physical electrostatic model to the measured a matrix and compute pixel boundary shifts (and optionally per-filter via conversion depth). This path is more involved but gives a compact, physics-based calibration.
+### Scalar Kernel Correction (Coulton et al. 2019)
 
-The sections below spell out the steps in more detail.
-
----
-
-## Step-by-step: covariance measurement and PTC fit
-
-**Step 1: Pair flats and form difference images.** Group flat exposures into pairs at the same nominal flux (e.g. by exposure time or by measured mean). For each pair $(F_1, F_2)$, apply calibration (bias, dark, linearity) so that the difference $F_1 - F_2$ has zero mean apart from noise. Compute the mean signal $\mu$ and the variance and covariances of the difference image per amplifier.
-
-**Step 2: Compute covariances.** For each pair and amplifier, compute $C_{ij}$ using Eq. 1. The FFT method (Astier et al. Appendix A) gives all lags at once. Use a maximum lag of at least 8–10 pixels; Broughton et al. show that summing covariances out to ~8 pixels recovers the Poisson variance.
-
-**Step 3: Fit the full covariance model.** Fit Eq. 2 to the measured $C_{ij}(\mu)$ over the chosen flux range (e.g. up to pCTI turnoff). The fit yields **gain** $g$, **noise** $n_{ij}$, and the **a matrix** (and optionally **b**) per amplifier. Store the a matrix and, if you will use the “sample at a flux” option for the kernel, the full fitted model. Reject or mask bad amplifiers before the next stage.
-
----
-
-## Step-by-step: kernel-based calibration and correction
-
-**Step 4a: Build the “pre-kernel” (correlation matrix).** From the PTC data (and optionally the fitted full model), form a single correlation matrix per amplifier that will serve as the source term in $\nabla^2 K = \text{source}$. Common options:
+From the PTC data we form a single correlation matrix per amplifier that will serve as the source term in $\nabla^2 K = \text{source}$. Common options:
 
 - **Average of measured correlations.** At each flux level, convert covariances to electrons, subtract Poisson at (0,0), divide by $-2$ and by $\mu^2$ (Coulton et al. Eq. 29). Reject pairs that fail sanity checks (e.g. $q_{00}>0$ or triangle-inequality violation). Average (e.g. sigma-clipped) over flux. This gives a flux-independent correlation matrix.
 - **Quadratic fit.** Fit the correlation at each lag $(i,j)$ as a function of $\mu^2$ and use the slope as the flux-independent correlation.
