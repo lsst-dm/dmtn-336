@@ -64,11 +64,11 @@ C_{ij}(\mu) = \frac{\mu}{g}\Bigl[\delta_{i0}\delta_{j0}
 $$
 
 - $g$ is the gain (electrons per ADU). $n_{ij}$ is the noise covariance matrix (read noise, etc.).
-- $a_{ij}$ (units 1/e⁻) is the **fractional pixel area change** from accumulated charge—the linear part of the BFE. It is often called the **a matrix**.
+- $a_{ij}$ (units 1/e⁻) is the **fractional pixel area change** from accumulated charge—the linear part of the BFE. It is often called the $a$ matrix.
 - $b_{ij}$ is a higher-order, time-evolving term; in practice it is often fixed to zero to stabilize the fit.
 - $\otimes$ denotes discrete convolution. The terms in $\mu^2$ and $\mu^3$ are **higher-order BFE**; they are not negligible (e.g. ~20% of variance loss in Astier et al.; 15–30% in Broughton et al. at high flux).
 
-Fitting this model to the measured $C_{ij}(\mu)$ over a chosen flux range yields gain $g$, noise $n_{ij}$, and the **a matrix** (and optionally **b**) per amplifier. When **b** is fixed to zero, the fitted **a** matrix approximately satisfies $\sum a_{ij} \approx 0$ (zero-sum; Broughton et al.). The flux range should be restricted to below “turnoff” (e.g. pCTI turnoff) so that other effects near saturation do not contaminate the BFE estimate.
+Fitting this model to the measured $C_{ij}(\mu)$ over a chosen flux range yields gain $g$, noise $n_{ij}$, and the $a$ matrix (and optionally **b**) per amplifier. When **b** is fixed to zero, the fitted **a** matrix approximately satisfies $\sum a_{ij} \approx 0$ (zero-sum; Broughton et al.). The flux range should be restricted to below “turnoff” (e.g. pCTI turnoff) so that other effects near saturation do not contaminate the BFE estimate.
 
 **Note: that this equation is derived from a Taylor expansion of the photon transfer curve, and does not derive from electrostatics.**
 
@@ -125,7 +125,7 @@ A valid kernel satisfies three criteria:
 
 We flag and exclude amplifiers that fail as "bad amps" in the brighter-fatter kernel calibration data product.
 
-#### Apply the correction
+#### Correction
 
 While we calculate the brighter-fatter kernel per-amplifier, we ultimately average the good amplifiers together to construct a detector-level kernel that ultimately gets used to correct a single detector image in any band.
 
@@ -138,71 +138,109 @@ $$
 
 The factor 1/2 averages the BFE over the exposure since the first photon that falls into an empty pixel does not experience any BFE, while the last electron to fall into the pixel experiences double the effect. In practice the correction is applied iteratively: we update $F$ with the right-hand side, then repeat until the total amount of shifted charge across a single detector image in an iteration falls below a threshold (e.g. 10 electrons; typically 2–3 iterations if the calibration is good). 
 
+#### Flux-Conserving Correction
+
+An alternative implementation of the scalar kernel correction, selectable in ISR as `COULTON18_FLUX_CONSERVING`, uses the same kernel $K$ and the same underlying equation (Eq. 5) but applies the divergence in a pixelised, flux-conserving way. While we enforce the "zero sum" rule mentioned earlier, there is a limitation in the standard Coulton et al. formulation that allows the application of the normal correction to no longer conserve charge. The issue arises because the Coulton correction assumes the electric field represented by the kernel is discrete, when in reality, it is continuous. Derivatives of the convolution $K\otimes F$ during the correction happen discretely, and the discrete derivative stencil can in principle allow small flux leaks. The "flux conserving correction" computes a correction that gets added to the image to account for the difference between a discrete and continuous derivative. At each boundary it computes the flux that would have been transferred across a given edge and adds/subtracts that flux from the two adjacent pixels so that total flux is exactly conserved (donor pixel loses the same amount the receiving pixel gains). This pixelised flux transfer is applied along both axes and yields a correction array that is then added to the image. The result is improved correction of the cores of stars where flux conservation matters most. 
+
+The flux-conserving version also handles image edges differently. The image to be corrected is padded (with zeros) by an amount equal to the size of the kernel, and the convolution is performed on the padded array so that wrap-around is avoided; the output is trimmed back to the original image dimensions. This avoids discontinuities at the image boundary (though it is still not a physical model for the edges, and may be less appropriate since we know that the electric fields at the edges of images are not the same as the centers of the images). In practice, we mask these edges as "EDGES" in the bit-mask plane of the exposure. The correction is applied iteratively with the same convergence criterion as the standard method (total absolute change below a threshold, or maximum iterations). The flux-conserving implementation is due to L. Miller (DM-38555) and is available in `ip_isr` as `fluxConservingBrighterFatterCorrection`.
+
 **Note: The factor of 1/2 that averages the BFE correction assumes that the flux of charge into a pixel does not change during the integration of the exposure. In practice, a slowly-varying PSF during integration will cause this assumption to break. However, simulated tests show that the impact of varying PSF on the misestimation of the magnitude of the BFE is small, and is likely to be noise at the downstream point of PSF estimation and fitting across an image.**
 
-**Note: The convolution operation happens using SciPy's `fftconvolve` method, which internal tests showed gives us our required speed performance with no loss in precision to 64-bt precision compared to a brute force approach.**
+**Note: The standard (non–flux-conserving) convolution uses SciPy's `fftconvolve` method; the flux-conserving path uses `afwMath.convolve` with padding as described above.**
 
 
 ### Vector Electrostatic Model Correction
 
-The electrostatic (vector) correction assumes that pixel boundary shifts arise from a physical model: charge at different depths in the sensor produces electric fields that deflect drifting electrons and shift effective pixel boundaries. The measured **a matrix** from the PTC (Eq. 2) encodes the linear response of pixel area to accumulated charge. We fit an electrostatic model—parameterized by detector thickness, pixel size, charge-layer depths ($z_q$, $z_{\mathrm{sh}}$, $z_{\mathrm{sv}}$), and scale/offset ($\alpha$, $\beta$)—to the measured a matrix by minimizing weighted residuals (e.g. least-squares with weights $1/\sigma^2_{ij}$). The model integrates E-fields over pixel boundaries and over charge depth; it can be averaged over a **conversion-depth distribution** (filter throughput × silicon absorption, Rajkanan et al. 1979) to produce a per-filter calibration. The output is an **electrostatic BFE distortion matrix**: fitted physical parameters plus pixel boundary shifts (aN, aS, aE, aW) and area-change arrays, optionally per filter.
+The electrostatic correction was first implemented for Hyper-Suprime Cam (HSC) by Astier et al. (2023) to account for more complicated charge interactions in the pixel. Realistically, when an image is integrating, individual pixel boundaries can shift differently from one another. Flat field statistics can not provide enough information to derive the distortions to individual pixel boundaries without additional modeling from electrostatics (instead of an $a$ matrix one would have a vector of $a_N$, $a_S$, $a_E$, $a_W$ matrices). The electrostatic correction assumes that pixel boundary shifts arise from a physical electrostatic model: charge at different depths in the sensor produces electric fields that deflect drifting electrons and shift effective pixel boundaries. The measured $a$ matrix from the PTC encodes the linear response of pixel area to accumulated charge summed over all boundaries of the pixel (area lost by all N,S,E,W boundaries). We fit an electrostatic model to the measured $a$ matrix, parameterized by:
 
-#### Calibration generation
+1. **Detector thickness:** The physical thickness of the silicon sensor, which influences the drift path and integration depth of electrons.
+2. **Pixel size:** The physical width and height of a pixel, setting the spatial scale for charge deflection and field evaluation.
+3. **Height of stored charge cloud ($z_q$):** The vertical (depth) location within the sensor where charge accumulates during exposure.
+4. **Height of electric field saddle points ($z_{\mathrm{sh}}$, $z_{\mathrm{sv}}$):** The heights at which the electric field saddle points occur on the horizontal ($z_{\mathrm{sh}}$) and vertical ($z_{\mathrm{sv}}$) pixel boundaries, affecting how the transverse field integrates across boundaries.
+5. **Charge cloud shape:** The assumed geometry of the stored charge, typically modeled as a flat rectangle characterized by length $a$ and width $b$.
+6. **Scale/offset ($\alpha$, $\beta$):** Fitting parameters that adjust the overall scale ($\alpha$) and offset ($\beta$) of the model to best match observations.
 
-Inputs are the fitted **a matrix** (and its uncertainty) per amplifier from the full covariance PTC fit. We optionally average the a matrix over good amplifiers and compute an uncertainty matrix; bad amplifiers are excluded. We then fit the electrostatic model to the mean a matrix over a chosen pixel range (fit range ≤ PTC covariance range). Initial parameter values and which parameters are varied are set in configuration (e.g. thickness and pixel size often fixed from known hardware; charge depths and scale/offset varied). The fit is performed with a standard minimizer (e.g. least-squares); if the first fit fails, the implementation may retry with looser tolerances. From the best-fit parameters we compute **boundary shifts** (North, South, East, West) and **area-change** arrays. When per-filter correction is enabled, we compute a conversion-depth distribution for each filter (flat SED over the filter band, silicon absorption vs wavelength) and integrate the electrostatic model over that distribution to obtain boundary shifts and area-change arrays per filter. The result is stored as the electrostatic BFE distortion matrix calibration (one per detector, with optional per-filter arrays).
+The BFE calibration is therefore not a kernel, but a **model** that can be evaluated to compute $a_N$, $a_S$, $a_E$, and $a_W$ (and hence the amount of charge lost/gained at each pixel boundary). The model can be averaged over a conversion-depth distribution (filter throughput × silicon absorption, Rajkanan et al. 1979) to produce a per-filter calibration. The output is an **electrostatic BFE distortion matrix**: fitted physical parameters plus pixel boundary shifts (aN, aS, aE, aW) and area-change arrays, optionally per filter.
+
+#### Algorithm
+
+Inputs are the average $a$ matrix per detector (and its uncertainty estimated as the elementwise scatter over all "good" amplifiers) from the full covariance PTC fit. The measured $a$ encodes the linear relation between pixel area change and charge content (Astier & Regnault 2023, Eq. 1):
+
+$$
+\frac{\delta A}{A} = g \sum_{i,j} a_{ij}\, Q_{ij},
+$$
+
+where $A$ is the pixel area, $\delta A$ its change, $Q_{ij}$ the charge (in electrons or ADU with gain $g$), and $a_{ij}$ the sensor coefficients (el$^{-1}$). By parity, $a_{ij} = a_{|i||j|}$; for uniform illumination the **sum rule** $\sum_{i,j} a_{ij} = 0$ holds. The full $a$ matrix is the sum of area changes at the four pixel boundaries (N, S, E, W).
+
+Given the set of physical electrostatic model parameters, we compute the boundary shifts at each pixel edge by integrating the transverse electric field along the drift path (from the relevant saddle height $z_{\mathrm{sh}}$ or $z_{\mathrm{sv}}$ to the integration depth $z_f$). With $\alpha$ the overall scale from the fit (Astier & Regnault 2023):
+
+$$
+a_N = -\alpha \int_{z_{\mathrm{sh}}}^{z_f} E_y\,\mathrm{d}z \quad \text{(North)}, \qquad
+a_S,\, a_E,\, a_W \quad \text{analogously},
+$$
+
+with the field evaluated at the pixel boundary. The model computes the E-field from the charge distribution (Coulomb + image charges), integrates via Gauss's Law to get $a_N$, $a_S$, $a_E$, $a_W$, and sums them elementwise to get the predicted $a$ matrix. We update the parameters in a least-squares fit to the measured $a$ matrix over a chosen pixel range (fit range ≤ total computed PTC covariance range). 
+
+This mode allows us to optionally compute the chromatic component of the BFE, because we could choose to integrate the electric fields up to the top of the silicon sensor (as if all photons converted to electrons at the top) or we could assume an incident flat SED of light and use an empirical model the of the conversion depth in silicon @ 173K (operating temperature of the LSSTCam CCDs). In this way we can compute the model for the filter that the PTC data was taken in. Additionally, since the calibration is just the electrostatic model, so we can compute a per-filter correction for any image in any filter we want to apply the BF correction to. In other words, we can compute an electrostatic BF calibration in any filter, even if we only have PTC data in one filter.
+
+We use an empirical model for the conversion depth in silicon at a given temperature from Rajkanan et al. (1979), which was also used for the HSC implementation.
+Python functions used to compute the Rajkanan et al. model is included in the released software.
+
+To save time in the instrument signature removal portion, we can pre-compute the BF distortion matrices per filter and have them ready-to-go to apply to any exposure taken in any of those filters.
+
+We expect that the BFE is weaker in the redder bands, and we find that $a_{00}$ in y band is 6\% weaker than in e.g. u band.
 
 #### Validity checks
 
 We assess the electrostatic calibration using fit quality and physical plausibility. Typical checks include: reduced $\chi^2$ and residuals of the model vs the measured a matrix; parameter uncertainties from the fit covariance; and sanity of the fitted geometry (e.g. charge depths within the detector thickness). Optionally we compare the predicted a matrix from the best-fit model to the measured a matrix over the fit range. Amplifiers or detectors with failed fits or implausible parameters can be flagged or excluded from the calibration product. There is no single universal acceptance threshold; projects may define criteria (e.g. $\chi^2$/dof below a limit, or parameter errors below a fraction of the parameter value) for deployment.
 
-#### Apply the calibration
+#### Correction
 
-The electrostatic correction is applied in instrument signature removal (ISR) when the electrostatic BFE distortion matrix calibration is attached and BFE correction is enabled. The corrector uses the boundary-shift arrays (aN, aS, aE, aW) and area-change arrays to redistribute flux according to the modeled pixel boundary motion (or equivalently to apply the deflection field implied by the electrostatic solution). For a given exposure, the calibration may be chosen by filter so that the per-filter boundary shifts (when available) are used; otherwise the single default (e.g. surface-conversion) calibration is used. The correction is applied to the detector image before downstream processing (e.g. source detection and measurement). Iteration may be used (analogous to the kernel correction) until the applied shift converges.
+The electrostatic correction is applied in instrument signature removal (ISR). The corrector uses the boundary-shift arrays (aN, aS, aE, aW)—the integrated transverse E-field along the drift path from the electrostatic fit (Algorithm above)—and area-change arrays to redistribute flux according to the modeled pixel boundary motion (or equivalently to apply the deflection field implied by the electrostatic solution). If per-filter corrections are turned on, the calibration can compute on the fly the distortion matrices needed to correct the exposure in its native filter. the calibration may be chosen by filter so that the per-filter boundary shifts (when available) are used; otherwise the single default (e.g. surface-conversion) calibration is used.
 
+From the boundary-shift arrays, which are computed in quadrants, we compute two tiled ($(2n+1)\times(2n+1)$) matrices, to model the vertical pixel boundary shifts and the horizontal pixel boundary shifts. Note that these are no longer required to be symmetric, which is more realistic!
 
+This correction is not performed iteratively. Instead of having to do multiple convolutions until a convergence condition is met. We simply perform exactly 2 convolutions with each of the vertical and horizontal boundary shifts. 
 
-(summary-and-recommended-choices)=
-## Summary and recommended choices
-
-| Aspect | Recommendation |
-|--------|----------------|
-| **Data** | Flat pairs over a wide flux range; compute covariances from the difference image (Eq. 1; FFT method in Astier et al. Appendix A). |
-| **PTC / covariance model** | Fit the full model (Eq. 2) to get gain, noise, and the a matrix; restrict the flux range to below turnoff (e.g. pCTI) to avoid contamination. |
-| **Kernel construction** | Pre-kernel from averaged correlations, quadratic fit, a matrix, or **sampled full model at a flux** (Broughton et al.). Enforce **zero-sum** on the kernel. Solve $\nabla^2 K = \text{source}$. |
-| **Correction** | Apply Eq. 5 iteratively until convergence. |
-| **Electrostatic path** | Optional; fit electrostatic model to a matrix, then compute boundary shifts (and optionally per-filter via conversion depth). |
-
----
 
 ## Comparison of the two corrections
 
-The scalar kernel correction (Coulton et al. / Broughton et al.) and the electrostatic (model-based) correction both consume the same PTC-derived inputs (covariances and a matrix) but differ in their assumptions, outputs, and how they are validated and applied.
+The scalar kernel correction (Coulton et al. / Broughton et al.) and the electrostatic (model-based) correction both consume the same PTC-derived inputs (covariances and a matrix) but differ in their assumptions, outputs, and how they are validated and applied, as well as their overall performance.
 
 **Scalar kernel correction**
 
-- **Main assumption:** The deflection field can be written as the gradient of a scalar kernel $K$; the BFE-induced covariance is $-\mu^2 \nabla^2 K$. The kernel is often treated as flux-independent (or sampled at one flux to absorb higher-order terms).
+- **Main assumption:** The deflection field can be written as the gradient of a scalar kernel $K$; the BFE-induced covariance is $-\mu^2 \nabla^2 K$. The kernel is often treated as flux-independent (or sampled at one flux to absorb higher-order terms). Does not rely on electrostatics (non-parametric).
 - **Input from PTC:** Raw covariances and/or the fitted a matrix (or full covariance model sampled at a flux).
-- **Output:** A convolution kernel $K$ per amplifier (or per detector).
-- **Chromatic / per-filter:** Single kernel per detector (or amp) unless multiple calibrations are produced for different bands.
-- **Application:** Correct the image with Eq. 5 (iterative convolution with $K$). Simple to plug into ISR.
+- **Output:** A convolution kernel $K$ per amplifier (always applied per detector).
+- **Chromatic / per-filter:** Single kernel per detector unless multiple calibrations are produced for different bands.
+- **Application:** Correct the image with Eq. 5 (iterative convolution with $K$). No fixed number of convolution operations.
 - **Acceptance / validity:** Kernel checks: edge values ≈ 0, center is minimum, off-center values negative; iterative correction convergence (e.g. total shifted charge below a threshold per iteration). Reject or flag amps that fail.
-- **When to prefer:** Straightforward to implement and run; well suited when a single effective kernel per detector is acceptable and chromatic effects are modest (e.g. u–r).
-- **Limitations:** Flux-independent kernel is an approximation (higher-order BFE); sampling at one flux improves this but does not remove the approximation. Flat-field–derived kernel can perform differently on stars (Broughton et al.).
+- **Limitations:** Flux-independent kernel is an approximation (higher-order BFE); sampling at one flux improves this but does not remove the approximation. In addition, it cannot account for differences in pixel boundaries and non-zero curl of the pixel boundary displacements. Flat-field–derived kernel can perform differently on stars.
 
 **Electrostatic (model-based) correction**
 
 - **Main assumption:** Pixel boundary shifts arise from a physical electrostatic model (charge layers, E-fields, detector geometry). The measured a matrix is fit by this model; the model can then be evaluated at any flux and at any conversion depth.
 - **Input from PTC:** Fitted a matrix (and its uncertainty) only.
-- **Output:** Fitted physical parameters plus pixel boundary shifts (aN, aS, aE, aW, area-change arrays), optionally per filter via conversion-depth weighting.
+- **Output:** Fitted physical parameters plus pixel boundary shifts (aN, aS, aE, aW, area-change arrays), computed per-detector, and optionally per filter via conversion-depth weighting.
 - **Chromatic / per-filter:** Naturally supports per-filter calibration via conversion-depth distribution (filter throughput × silicon absorption).
 - **Application:** Correct using the boundary-shift or area-change arrays in a model-based corrector (pixel boundaries or flux redistribution).
-- **Acceptance / validity:** Fit quality (e.g. $\chi^2$, residuals), parameter uncertainties, and physical plausibility of the fitted geometry. Optionally compare predicted vs measured a matrix.
-- **When to prefer:** When per-filter or physically interpretable calibration is desired, or when extrapolation to flux/conversion depth not covered by flats is needed.
+- **Acceptance / validity:** Fit quality (e.g. $\chi^2$, residuals), parameter uncertainties.
 - **Limitations:** Requires a concrete electrostatic model and more tuning (parameter bounds, conversion-depth model). More complex pipeline and validation.
 
 In short: the kernel correction is empirical and easy to deploy; the electrostatic correction is model-driven and more flexible for chromatic and multi-flux use at the cost of complexity and validation effort.
 
----
+**Note: Before the electrostatic BF correction was implemented, we had BF correction turned off for the Prompt Processing (PP) pipeline because having some images take 1-2 iterations and some images take 3+ iterations of the kernel to be corrected meant that images finished processing non-uniformly, which made it difficult for processing difference imaging sources. With the electrostatic BF correction, we only have a fixed number (2) convolution operations to do, so we were able to turn on BF correction for PP.**
+
+
+## Algorithms used in Data Releases
+
+- DP1 used the kernel-based implementation with no color corrections and no flux-conserving correction. The PTC data used to compute the calibration was sparsely sampled in flux space, and was only computed for i-band. We observed a distinct over-correction of the BFE in DP1.
+
+- DP2 used the electrostatic implementation with no color corrections (assumes all photons convert near the top of the silicon chip).
+
+We found in DP2 that the kernel-based implementation was useful for in-lab artificial star tests in the LSSTCam focal plane, however we found the correction over-corrected by more than 10\% (!) in on-sky images. We then implemented and switched to the elesctrostatic correction and are now meeting the LSST Y10 required threshold for the slope of residual PSF size vs magnitude space for DP2. We have also found that the elesctrostatic algorithm works so well that we were able to use that fact that shape measurement algorithms (HSM) are sensitive to residual sky background to actually characterize the amount of residual sky background oversubtraction in the galactic plane regions by comparing the observed size vs magnitude plots to the expected ones with perfect BF calibration, thereby recovering accurate PSF photometry in dense stellar regions. 
+
+**Note: We are currently running internal tests of the filter correction and might turn this on for DR1.**
 
 ## References
 
@@ -211,17 +249,3 @@ In short: the kernel correction is empirical and easy to deploy; the electrostat
 - **Coulton et al. (2017/2018)** — Scalar kernel correction; [arXiv:1711.06273](https://arxiv.org/abs/1711.06273). Correlation and kernel (Eq. 22–29).
 - **Downing et al. (2006)** — Charge conservation and covariance sum.
 - **Rajkanan et al. (1979)** — Silicon absorption coefficient; used for conversion-depth distribution in filter-dependent electrostatic correction.
-
----
-
-## Appendix: LSST Science Pipelines implementation
-
-For readers who want to compare with or reuse the LSST implementation:
-
-- **Covariance extraction:** Flat pairs and FFT covariance from the difference image: `cp_pipe` PTC extract tasks; `CovFastFourierTransform` in `lsst.cp.pipe.utils`.
-- **PTC / full covariance fit:** Fit of Eq. 2 (Astier et al. Eq. 20): `PhotonTransferCurveSolveTask` in `cp_pipe.ptc` with `ptcFitType: "FULLCOVARIANCE"`.
-- **Kernel construction:** Pre-kernel options, zero-sum, SOR solve: `BrighterFatterKernelSolveTask` in `lsst.cp.pipe.cpBfk`. Pipeline: `pipelines/_ingredients/cpBfkLSST.yaml`.
-- **Electrostatic fit:** Electrostatic model fit to a matrix, boundary shifts, conversion depth: `ElectrostaticBrighterFatterSolveTask` in `lsst.cp.pipe.cpElectrostaticBF`. Pipeline: `pipelines/_ingredients/cpElectrostaticBFDistortionMatrixLSST.yaml`.
-- **Correction application:** Kernel or electrostatic correction in ISR when the calibration is attached; see `lsst.ip.isr` and `doBrighterFatter`.
-
-All of the above are in the [LSST Science Pipelines](https://pipelines.lsst.io) (packages `cp_pipe`, `ip_isr`).
